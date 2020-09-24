@@ -1,0 +1,5 @@
+profile: service
+defaultPackage: io.zenkoderz.labs.acceptor
+---
+testFramework: junit
+sourceLanguage: java
