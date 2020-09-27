@@ -16,8 +16,12 @@
 package io.zenkoderz.labs.acceptor.controller;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
+import io.micronaut.context.annotation.Parameter;
 import io.micronaut.core.util.CollectionUtils;
+import io.micronaut.core.util.StringUtils;
 import io.micronaut.http.HttpRequest;
 import io.micronaut.http.HttpResponse;
 import io.micronaut.http.HttpStatus;
@@ -35,15 +39,18 @@ import io.netty.handler.codec.base64.Base64Dialect;
 import io.netty.util.CharsetUtil;
 import io.reactivex.Flowable;
 import io.zenkoderz.labs.acceptor.Application;
-import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.URLEncoder;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.Comparator;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.Builder;
 import lombok.Getter;
@@ -56,8 +63,11 @@ import org.slf4j.LoggerFactory;
 @Controller()
 public class RedirectTargetController {
 
-  final static String authUrl = "http://localhost:4444/oauth2/auth";
-  final static String tokenUrl = "http://localhost:4444/oauth2/token";
+  final static String hydraUrl = "http://localhost:4444";
+  final static String authPath = "/oauth2/auth";
+  final static String tokenPath = "/oauth2/token";
+  final static String userInfoPath = "/userinfo";
+  final static String logoutPath = "/oauth2/sessions/logout";
   final String redirectUri = "http://localhost:11111/accept";
 
   final String clientId = "acceptor";
@@ -65,103 +75,292 @@ public class RedirectTargetController {
   final String[] scope = {"openid", "offline"};
   final String responseType = "code";
   final String codeChallengeMethod = "S256";
-
-  final Map<String, String> codeVerifiers = new HashMap<>();
-
+  final Map<String, AuthenticationObject> sessions = new ConcurrentHashMap<>();
   final Logger logger = LoggerFactory.getLogger(Application.class);
-
-  @Client(tokenUrl)
+  final private MessageDigest messageDigest;
+  final private ObjectMapper objectMapper;
+  final private ObjectWriter prettyWriter;
+  @Client(hydraUrl)
   @Inject
   HttpClient httpClient;
 
-  @View("home")
-  @Get()
-  public HttpResponse<?> home() {
-
-    try {
-      MessageDigest digest = MessageDigest.getInstance("SHA-256");
-
-      final String codeVerifier = RandomStringUtils.randomAlphanumeric(80);
-      final String state = RandomStringUtils.randomAlphanumeric(10);
-
-      ByteBuf encodedData = Unpooled.wrappedBuffer(digest.digest(codeVerifier.getBytes()));
-      ByteBuf encoded = Base64.encode(encodedData, Base64Dialect.URL_SAFE);
-      final String codeChallenge = encoded.toString(CharsetUtil.UTF_8)
-          .replace("=", "").replace("+", "-").replace("/", "_");
-
-      final String uri = String.format("%s?response_type=%s&state=%s&client_id=%s" +
-              "&scope=%s&redirect_uri=%s&code_challenge_method=%s&code_challenge=%s",
-          authUrl, responseType, state, clientId,
-          URLEncoder.encode(String.join(" ", scope), CharsetUtil.UTF_8),
-          URLEncoder.encode(redirectUri, CharsetUtil.UTF_8), codeChallengeMethod, codeChallenge);
-      logger.info(uri);
-      codeVerifiers.put(state, codeVerifier);
-      return HttpResponse.ok(CollectionUtils.mapOf("target", uri));
-
-    } catch (NoSuchAlgorithmException e) {
-      final StringWriter buffer = new StringWriter();
-      final PrintWriter writer = new PrintWriter(buffer, true);
-      e.printStackTrace(writer);
-      final String result = buffer.toString();
-      try {
-        writer.close();
-        buffer.close();
-      } catch (IOException ioException) {
-        // do nothing
-      }
-      return HttpResponse.serverError(result);
-    }
+  public RedirectTargetController() throws NoSuchAlgorithmException {
+    objectMapper = new ObjectMapper();
+    prettyWriter = objectMapper.writerWithDefaultPrettyPrinter();
+    messageDigest = MessageDigest.getInstance("SHA-256");
   }
 
-  @View("payload")
+  @View("home")
+  @Get
+  public HttpResponse<?> home() {
+    return doResponse();
+  }
+
+  @View("home")
   @Get(value = "/accept")
-  public HttpResponse<?> index(final HttpRequest<String> request) throws JsonProcessingException {
+  public HttpResponse<?> index(final HttpRequest<String> request) {
     final String code = request.getParameters().get("code");
     final String state = request.getParameters().get("state");
-    final String codeVerifier = codeVerifiers.get(state);
+    final AuthenticationObject authenticationObject = sessions.get(state);
 
-    if (code == null || codeVerifier == null) {
-      return HttpResponse
-          .ok(CollectionUtils.mapOf("payload", request.toString(), "error", "failed request"));
+    if (authenticationObject == null) {
+      return doResponse();
+    }
+    if (code == null) {
+      authenticationObject.setFailed(true);
+      return doResponse();
+    }
+    authenticationObject.setCodeToken(code);
+    requestToken(authenticationObject, false);
+    return doResponse();
+  }
+
+  @View("home")
+  @Get(value = "/refresh-token/{state}")
+  public HttpResponse<?> refreshToken(@Parameter("state") final String state) {
+    final AuthenticationObject authenticationObject = sessions.get(state);
+    if (authenticationObject == null || !authenticationObject.isConnected() || authenticationObject
+        .isEnded()) {
+      return doResponse();
     }
 
-    Map<CharSequence, CharSequence> data = new LinkedHashMap<>();
-    data.put("grant_type", grantType);
-    data.put("code", code);
-    data.put("redirect_uri", redirectUri);
-    data.put("code_verifier", codeVerifier);
-    data.put("client_id", clientId);
-    data.put("client_secret", null);
+    requestToken(authenticationObject, true);
+    return doResponse();
+  }
 
-    MutableHttpRequest<?> mutableHttpRequest = HttpRequest.POST("", data)
-        .contentType(MediaType.APPLICATION_FORM_URLENCODED);
+  @View("home")
+  @Get(value = "/logout/{state}")
+  public HttpResponse<?> logout(@Parameter("state") final String state) {
+    final AuthenticationObject authenticationObject = sessions.get(state);
+    if (authenticationObject == null || !authenticationObject.isConnected() || authenticationObject
+        .isEnded()) {
+      return doResponse();
+    }
+    MutableHttpRequest<?> mutableHttpRequest = HttpRequest.GET(logoutPath)
+        .accept(MediaType.APPLICATION_JSON);
+    mutableHttpRequest.header("Authorization", "Bearer " + authenticationObject.getAccessToken());
+    try {
+      Flowable<HttpResponse<String>> call = Flowable
+          .fromPublisher(httpClient.exchange(mutableHttpRequest, String.class));
+      HttpResponse<String> httpResponse = call.blockingSingle();
+
+      constructResponse(httpResponse, authenticationObject);
+    } catch (Exception e) {
+      try (StringWriter stringWriter = new StringWriter(); PrintWriter writer = new PrintWriter(
+          stringWriter)) {
+        e.printStackTrace(writer);
+        authenticationObject.setResponseJson(stringWriter.toString());
+      } catch (Exception ex) {
+        // do nothing;
+      }
+    }
+
+    return doResponse();
+  }
+
+  private void requestToken(final AuthenticationObject authenticationObject,
+      final boolean refresh) {
+    Map<CharSequence, CharSequence> data = new HashMap<>();
+    data.put("client_id", clientId);
+
+    if (refresh) {
+      if (authenticationObject.getRefreshToken() == null) {
+        return;
+      }
+      data.put("refresh_token", authenticationObject.getRefreshToken());
+      data.put("grant_type", "refresh_token");
+    } else {
+      data.put("redirect_uri", redirectUri);
+      data.put("grant_type", grantType);
+      data.put("code_verifier", authenticationObject.getCodeVerifier());
+      data.put("code", authenticationObject.getCodeToken());
+      data.put("client_secret", null);
+    }
+
+    MutableHttpRequest<?> mutableHttpRequest = HttpRequest.POST(tokenPath, data)
+        .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+        .accept(MediaType.APPLICATION_JSON_TYPE);
+    HttpResponse<String> httpResponse;
+    try {
+      Flowable<HttpResponse<String>> call = Flowable
+          .fromPublisher(httpClient.exchange(mutableHttpRequest, String.class));
+      httpResponse = call.blockingSingle();
+    } catch (Exception e) {
+      try (StringWriter stringWriter = new StringWriter(); PrintWriter writer = new PrintWriter(
+          stringWriter)) {
+        e.printStackTrace(writer);
+        authenticationObject.setResponseJson(stringWriter.toString());
+      } catch (Exception ex) {
+        // do nothing;
+      }
+      return;
+    }
+
+    constructResponse(httpResponse, authenticationObject);
+
+    if (!httpResponse.getStatus().equals(HttpStatus.OK)) {
+      authenticationObject.setFailed(true);
+      return;
+    }
+
+    httpResponse.getBody().ifPresent(body -> {
+      try {
+        JsonNode jsonNode = objectMapper.readTree(body);
+        authenticationObject.setAccessToken(getValue(jsonNode, "access_token"));
+        authenticationObject.setIdToken(getValue(jsonNode, "id_token"));
+        authenticationObject.setTokenType(getValue(jsonNode, "token_type"));
+        authenticationObject.setScope(getValue(jsonNode, "scope"));
+        authenticationObject.setRefreshToken(getValue(jsonNode, "refresh_token"));
+        final String ttl = getValue(jsonNode, "expires_in");
+        if (StringUtils.isNotEmpty(ttl)) {
+          authenticationObject.setExpiresIn(Long.parseLong(ttl));
+        }
+        authenticationObject.setConnected(true);
+      } catch (JsonProcessingException e) {
+        authenticationObject.setFailed(true);
+        // do nothing
+      }
+    });
+  }
+
+  private String getValue(final JsonNode node, final String name) {
+    if (node.has(name)) {
+      return node.get(name).asText();
+    }
+    return null;
+  }
+
+  @View("home")
+  @Get(value = "/user-info/{state}")
+  public HttpResponse<?> retrieveUserInfo(@Parameter("state") final String state) {
+    final AuthenticationObject authenticationObject = sessions.get(state);
+    if (authenticationObject == null || !authenticationObject.isConnected() || authenticationObject
+        .isEnded()) {
+      return doResponse();
+    }
+    MutableHttpRequest<?> mutableHttpRequest = HttpRequest.GET(userInfoPath)
+        .accept(MediaType.APPLICATION_JSON);
+    mutableHttpRequest.header("Authorization", "Bearer " + authenticationObject.getAccessToken());
     Flowable<HttpResponse<String>> call = Flowable
         .fromPublisher(httpClient.exchange(mutableHttpRequest, String.class));
     HttpResponse<String> httpResponse = call.blockingSingle();
 
-    Response response = Response.builder()
-        .headers(httpResponse.getHeaders().asMap(String.class, String.class))
-        .build();
-    final ObjectMapper mapper = new ObjectMapper();
+    constructResponse(httpResponse, authenticationObject);
+
     httpResponse.getBody().ifPresent(body -> {
       try {
-        response.setBody(mapper.readTree(body));
+        JsonNode jsonNode = objectMapper.readTree(body);
+        authenticationObject.setUserInfoJson(prettyWriter.writeValueAsString(jsonNode));
+
       } catch (JsonProcessingException e) {
-        response.setBody(body);
+        authenticationObject.setUserInfoJson(body);
       }
     });
-    String json = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(response);
-    return HttpResponse.ok(CollectionUtils.mapOf("payload", json));
+
+    return doResponse();
+  }
+
+  private void constructResponse(final HttpResponse<?> httpResponse,
+      final AuthenticationObject authenticationObject) {
+
+    authenticationObject.setTimeStamp(Instant.now(Clock.systemUTC()).toEpochMilli());
+
+    final Response response = Response.builder()
+        .headers(httpResponse.getHeaders().asMap(String.class, String.class))
+        .httpStatus(httpResponse.status())
+        .build();
+
+    if (httpResponse.body() != null) {
+      try {
+        final String body = (String) httpResponse.body();
+        JsonNode jsonNode = objectMapper.readTree(body);
+        response.setBody(jsonNode);
+      } catch (JsonProcessingException e) {
+        response.setBody(httpResponse.body());
+      }
+      try {
+        final String json = prettyWriter.writeValueAsString(response);
+        authenticationObject.setResponseJson(json);
+      } catch (JsonProcessingException e) {
+        // do nothing
+      }
+    }
+  }
+
+  private HttpResponse<?> doResponse() {
+    createNewAuthenticationObject();
+    return HttpResponse.ok(CollectionUtils.mapOf(
+        "sessions", sessions.values().stream()
+            .sorted(Comparator.comparingLong(o -> -o.getTimeStamp()))
+            .collect(Collectors.toList())));
+  }
+
+  private void createNewAuthenticationObject() {
+    if (!sessions.isEmpty() && sessions.values().stream()
+        .anyMatch(s -> !s.isConnected() && !s.isEnded() && !s.isFailed())) {
+      return;
+    }
+
+    final String codeVerifier = RandomStringUtils.randomAlphanumeric(80);
+    final String state = RandomStringUtils.randomAlphanumeric(10);
+
+    ByteBuf encodedData = Unpooled.wrappedBuffer(messageDigest.digest(codeVerifier.getBytes()));
+    ByteBuf encoded = Base64.encode(encodedData, Base64Dialect.URL_SAFE);
+    final String codeChallenge = encoded.toString(CharsetUtil.UTF_8)
+        .replace("=", "").replace("+", "-").replace("/", "_");
+
+    final String uri = String.format("%s?response_type=%s&state=%s&client_id=%s" +
+            "&scope=%s&redirect_uri=%s&code_challenge_method=%s&code_challenge=%s&lang=id",
+        hydraUrl + authPath, responseType, state, clientId,
+        URLEncoder.encode(String.join(" ", scope), CharsetUtil.UTF_8),
+        URLEncoder.encode(redirectUri, CharsetUtil.UTF_8), codeChallengeMethod, codeChallenge);
+
+    sessions.computeIfAbsent(state, s -> AuthenticationObject.builder()
+        .state(s)
+        .statusJson("Not logged in")
+        .codeChallenge(codeChallenge)
+        .codeVerifier(codeVerifier)
+        .loginUri(uri)
+        .timeStamp(Instant.now(Clock.systemDefaultZone()).toEpochMilli())
+        .build());
   }
 
   @Getter
   @Setter
   @ToString(doNotUseGetters = true)
   @Builder(toBuilder = true)
-  private static class Response {
+  public static class Response {
 
     private Map<String, String> headers;
     private HttpStatus httpStatus;
     private Object body;
+  }
+
+  @Getter
+  @Setter
+  @ToString(doNotUseGetters = true)
+  @Builder(toBuilder = true)
+  public static class AuthenticationObject {
+
+    public String state;
+    public String codeChallenge;
+    public String codeVerifier;
+    public String codeToken;
+    public String idToken;
+    public long expiresIn;
+    public long timeStamp;
+    public String accessToken;
+    public String refreshToken;
+    public String tokenType;
+    public String scope;
+    public String loginUri;
+    public String logoutUri;
+    public String refreshTokenUri;
+    public boolean failed;
+    public boolean connected;
+    public boolean ended;
+    public String statusJson;
+    public String responseJson;
+    public String userInfoJson;
   }
 }
