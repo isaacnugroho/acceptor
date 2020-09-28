@@ -59,6 +59,8 @@
               <a class="mdl-button mdl-js-button mdl-button--raised" href="/refresh-token/${s.state}">Refresh Token</a>
               <br/>
               <a class="mdl-button mdl-js-button mdl-button--raised" href="/logout/${s.state}">Logout</a>
+              <br/>
+              <a class="mdl-button mdl-js-button mdl-button--raised" href="/revoke/${s.state}">Revoke</a>
             </#if>
             <#if (!s.connected && !s.ended && !s.failed)><a class="mdl-button mdl-js-button mdl-button--raised" href="${s.loginUri}">Login</a></#if>
             <#if s.connected && s.ended>Terminated</#if>

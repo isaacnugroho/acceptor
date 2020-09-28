@@ -1,5 +1,5 @@
 # Acceptor
 
-Acceptor is a simple server to help me review responses in OAuth2.0 authorization flow.
+A simple client to test OAuth2 authentication.
 
  

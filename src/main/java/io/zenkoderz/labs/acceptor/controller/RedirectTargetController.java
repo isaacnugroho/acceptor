@@ -38,7 +38,6 @@ import io.netty.handler.codec.base64.Base64;
 import io.netty.handler.codec.base64.Base64Dialect;
 import io.netty.util.CharsetUtil;
 import io.reactivex.Flowable;
-import io.zenkoderz.labs.acceptor.Application;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.URLEncoder;
@@ -57,8 +56,6 @@ import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
 import org.apache.commons.lang3.RandomStringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 @Controller()
 public class RedirectTargetController {
@@ -66,9 +63,11 @@ public class RedirectTargetController {
   final static String hydraUrl = "http://localhost:4444";
   final static String authPath = "/oauth2/auth";
   final static String tokenPath = "/oauth2/token";
+  final static String revokePath = "/oauth2/revoke";
   final static String userInfoPath = "/userinfo";
   final static String logoutPath = "/oauth2/sessions/logout";
-  final String redirectUri = "http://localhost:11111/accept";
+  final String redirectUri = "http://localhost:11111/login-success";
+  final String logoutUri = "http://localhost:11111/logout-success";
 
   final String clientId = "acceptor";
   final String grantType = "authorization_code";
@@ -76,7 +75,6 @@ public class RedirectTargetController {
   final String responseType = "code";
   final String codeChallengeMethod = "S256";
   final Map<String, AuthenticationObject> sessions = new ConcurrentHashMap<>();
-  final Logger logger = LoggerFactory.getLogger(Application.class);
   final private MessageDigest messageDigest;
   final private ObjectMapper objectMapper;
   final private ObjectWriter prettyWriter;
@@ -97,8 +95,8 @@ public class RedirectTargetController {
   }
 
   @View("home")
-  @Get(value = "/accept")
-  public HttpResponse<?> index(final HttpRequest<String> request) {
+  @Get(value = "/login-success")
+  public HttpResponse<?> loginSuccess(final HttpRequest<String> request) {
     final String code = request.getParameters().get("code");
     final String state = request.getParameters().get("state");
     final AuthenticationObject authenticationObject = sessions.get(state);
@@ -112,7 +110,7 @@ public class RedirectTargetController {
     }
     authenticationObject.setCodeToken(code);
     requestToken(authenticationObject, false);
-    return doResponse();
+    return retrieveUserInfo(state);
   }
 
   @View("home")
@@ -136,9 +134,60 @@ public class RedirectTargetController {
         .isEnded()) {
       return doResponse();
     }
-    MutableHttpRequest<?> mutableHttpRequest = HttpRequest.GET(logoutPath)
+
+    MutableHttpRequest<?> mutableHttpRequest = HttpRequest.GET(logoutPath + "?state=" + state +
+        "&id_token_hint=" + authenticationObject.getIdToken() +
+        "&post_logout_redirect_uri=" + URLEncoder.encode(logoutUri, CharsetUtil.UTF_8))
         .accept(MediaType.APPLICATION_JSON);
     mutableHttpRequest.header("Authorization", "Bearer " + authenticationObject.getAccessToken());
+    doExchange(authenticationObject, mutableHttpRequest);
+    return doResponse();
+  }
+
+  @View("home")
+  @Get(value = "/revoke/{state}")
+  public HttpResponse<?> revoke(@Parameter("state") final String state) {
+    final AuthenticationObject authenticationObject = sessions.get(state);
+    if (authenticationObject == null || !authenticationObject.isConnected() || authenticationObject
+        .isEnded()) {
+
+      return doResponse();
+    }
+    ByteBuf encodedData = Unpooled.wrappedBuffer(messageDigest.digest(
+        (authenticationObject.getClientId() + ":" + authenticationObject.getSubject()).getBytes()));
+    ByteBuf encoded = Base64.encode(encodedData, Base64Dialect.URL_SAFE);
+    final String basic = encoded.toString(CharsetUtil.UTF_8);
+
+    Map<CharSequence, CharSequence> data = new HashMap<>();
+    data.put("token", authenticationObject.getRefreshToken());
+    data.put("token_type_hint", "refresh_token");
+    data.put("client_id", authenticationObject.getClientId());
+
+    MutableHttpRequest<?> mutableHttpRequest = HttpRequest.POST(revokePath, data)
+        .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+        .accept(MediaType.APPLICATION_JSON_TYPE);
+
+    mutableHttpRequest.header("Authorization", "Basic " + basic);
+    doExchange(authenticationObject, mutableHttpRequest);
+    return doResponse();
+  }
+
+  @View("home")
+  @Get(value = "/logout-success")
+  public HttpResponse<?> logoutSuccess(final HttpRequest<String> request) {
+    final String state = request.getParameters().get("state");
+
+    final AuthenticationObject authenticationObject = sessions.get(state);
+    if (authenticationObject == null || !authenticationObject.isConnected() || authenticationObject
+        .isEnded()) {
+      return doResponse();
+    }
+    authenticationObject.setEnded(true);
+    return doResponse();
+  }
+
+  private void doExchange(final AuthenticationObject authenticationObject,
+      final HttpRequest<?> mutableHttpRequest) {
     try {
       Flowable<HttpResponse<String>> call = Flowable
           .fromPublisher(httpClient.exchange(mutableHttpRequest, String.class));
@@ -155,7 +204,6 @@ public class RedirectTargetController {
       }
     }
 
-    return doResponse();
   }
 
   private void requestToken(final AuthenticationObject authenticationObject,
@@ -250,6 +298,7 @@ public class RedirectTargetController {
     httpResponse.getBody().ifPresent(body -> {
       try {
         JsonNode jsonNode = objectMapper.readTree(body);
+        authenticationObject.setSubject(jsonNode.get("sub").asText());
         authenticationObject.setUserInfoJson(prettyWriter.writeValueAsString(jsonNode));
 
       } catch (JsonProcessingException e) {
@@ -309,6 +358,7 @@ public class RedirectTargetController {
     final String codeChallenge = encoded.toString(CharsetUtil.UTF_8)
         .replace("=", "").replace("+", "-").replace("/", "_");
 
+    // login will be done at browser. Remember to clear cookies for new login
     final String uri = String.format("%s?response_type=%s&state=%s&client_id=%s" +
             "&scope=%s&redirect_uri=%s&code_challenge_method=%s&code_challenge=%s&lang=id",
         hydraUrl + authPath, responseType, state, clientId,
@@ -316,6 +366,7 @@ public class RedirectTargetController {
         URLEncoder.encode(redirectUri, CharsetUtil.UTF_8), codeChallengeMethod, codeChallenge);
 
     sessions.computeIfAbsent(state, s -> AuthenticationObject.builder()
+        .clientId(clientId)
         .state(s)
         .statusJson("Not logged in")
         .codeChallenge(codeChallenge)
@@ -341,16 +392,16 @@ public class RedirectTargetController {
   @ToString(doNotUseGetters = true)
   @Builder(toBuilder = true)
   public static class AuthenticationObject {
-
+    public String clientId;
+    public String subject;
     public String state;
     public String codeChallenge;
     public String codeVerifier;
     public String codeToken;
     public String idToken;
-    public long expiresIn;
-    public long timeStamp;
-    public String accessToken;
     public String refreshToken;
+    public long expiresIn;
+    public String accessToken;
     public String tokenType;
     public String scope;
     public String loginUri;
@@ -359,6 +410,7 @@ public class RedirectTargetController {
     public boolean failed;
     public boolean connected;
     public boolean ended;
+    public long timeStamp;
     public String statusJson;
     public String responseJson;
     public String userInfoJson;

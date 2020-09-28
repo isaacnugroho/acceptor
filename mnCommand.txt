@@ -1,1 +1,0 @@
-mn create-app io-zenkoderz-io-labs-acceptor --profile service --lang java --build gradle --features java-configuration
